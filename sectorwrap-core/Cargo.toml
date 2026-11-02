@@ -1,0 +1,12 @@
+[package]
+name = "sectorwrap-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+reed-solomon.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
