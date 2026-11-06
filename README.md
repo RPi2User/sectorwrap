@@ -62,13 +62,7 @@ the Rust library crates directly.
 
 ### Build and install
 
-Clone this repository:
-
-```sh
-git clone <repository-url> sectorwrap
-```
-
-First command after cloning:
+Clone this repository
 
 ```sh
 cd sectorwrap
