@@ -2,7 +2,7 @@
 
 use crate::{Backend, Geometry, SectorError};
 use std::fs::{File, OpenOptions};
-use std::io;
+use std::io::{self, Write};
 use std::os::fd::AsRawFd;
 
 const SG_IO: u64 = 0x2285;
@@ -72,7 +72,14 @@ impl SgIoBackend {
         for lba in 0..sectors {
             let encoded = self.geometry.encode_sector(lba, &payload)?;
             self.write_sector(lba, &encoded)?;
+            if (lba + 1) % 65_536 == 0 || lba + 1 == sectors {
+                let completed = lba + 1;
+                let percent = completed as f64 * 100.0 / sectors as f64;
+                eprint!("\rFormatting: {completed}/{sectors} ({percent:.1}%)");
+                io::stderr().flush()?;
+            }
         }
+        eprintln!();
         self.flush()
     }
 
