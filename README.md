@@ -44,25 +44,50 @@ flowchart LR
     X --> T[Test image]
 ```
 
-## Build and test
+## Use sectorwrap (CLI)
+
+`sectorwrap` is a command-line tool. Typical users should run the binaries, not
+the Rust library crates directly.
+
+### Dependencies
+
+- Rust toolchain (`cargo`, `rustc`) on stable
+- C toolchain with `cc` available
+- `pkg-config`
+- Linux kernel support for `ublk` and `io_uring` plus `/dev/ublk-control`
+  (required for `sectorwrap-ublk`)
+- Shared `libclang` library available at runtime/build time when building the
+  `ublk` feature (bindgen requirement)
+- SCSI generic device nodes (`/dev/sg*`) for real-device operation
+
+### Build and install
+
+Clone this repository
 
 ```sh
-cargo test --workspace
-cargo run -- 528
+cd sectorwrap
 ```
 
-The default executable is the device manager. The Linux ublk worker is kept
-separate from the safe core and is implemented in
-`sectorwrap-ublk` using `libublk`:
+Build release binaries:
 
 ```sh
-cargo run -p sectorwrap --features ublk --bin sectorwrap-ublk -- \
-  --sector-size 528 --sectors 1024
+cargo build --release --bin sectorwrap
+cargo build --release --features ublk --bin sectorwrap-ublk
 ```
 
-The `ublk` feature requires the platform's libclang development package because
-`libublk` generates Linux ABI bindings with bindgen. The default build and all
-format/mock tests remain platform-independent.
+Install both binaries together:
+
+```sh
+sudo install -Dm755 target/release/sectorwrap /usr/local/bin/sectorwrap
+sudo install -Dm755 target/release/sectorwrap-ublk /usr/local/bin/sectorwrap-ublk
+```
+
+Verify:
+
+```sh
+sectorwrap --help
+sectorwrap-ublk --help
+```
 
 ## Device manager
 

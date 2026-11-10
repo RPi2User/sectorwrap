@@ -2,7 +2,7 @@
 
 use crate::{Backend, Geometry, SectorError};
 use std::fs::{File, OpenOptions};
-use std::io;
+use std::io::{self, Write};
 use std::os::fd::AsRawFd;
 
 const SG_IO: u64 = 0x2285;
@@ -77,6 +77,7 @@ impl SgIoBackend {
         if !sectors.is_multiple_of(group) {
             return Err(SectorError::Unaligned);
         }
+        let counter_width = sectors.to_string().len();
         let mut lba = 0;
         while lba < sectors {
             let count = (sectors - lba).min(group);
@@ -87,7 +88,13 @@ impl SgIoBackend {
             }
             self.write_blocks(lba / group, 1, &data)?;
             lba += count;
+            if lba % 65_536 == 0 || lba == sectors {
+                let percent = lba as f64 * 100.0 / sectors as f64;
+                eprint!("\rFormatting: {lba:>counter_width$} / {sectors} ({percent:.1}%)");
+                io::stderr().flush()?;
+            }
         }
+        eprintln!();
         self.flush()
     }
 
