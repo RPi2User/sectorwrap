@@ -12,8 +12,8 @@ struct Args {
     device: Option<String>,
     #[arg(long, default_value_t = 528)]
     sector_size: usize,
-    #[arg(long, default_value_t = 1024)]
-    sectors: usize,
+    #[arg(long)]
+    sectors: Option<u64>,
     #[arg(long, default_value_t = -1)]
     id: i32,
     #[arg(long, default_value_t = 1)]
@@ -133,7 +133,7 @@ fn main() {
             eprintln!("cannot open SG_IO device {path}: {e}");
             std::process::exit(2);
         });
-        let (sectors, block_size) = backend.capacity().unwrap_or_else(|e| {
+        let (capacity, block_size) = backend.capacity().unwrap_or_else(|e| {
             eprintln!("cannot read capacity from {path}: {e}");
             std::process::exit(2);
         });
@@ -142,6 +142,11 @@ fn main() {
                 "device reports {block_size}-byte sectors, but --sector-size is {}",
                 geometry.physical_bytes
             );
+            std::process::exit(2);
+        }
+        let sectors = args.sectors.unwrap_or(capacity);
+        if sectors > capacity {
+            eprintln!("--sectors exceeds the device capacity ({capacity})");
             std::process::exit(2);
         }
         eprintln!(
@@ -158,14 +163,19 @@ fn main() {
             sectors,
         )
     } else {
+        let sectors = args.sectors.unwrap_or(1024);
+        let sector_count = usize::try_from(sectors).unwrap_or_else(|_| {
+            eprintln!("--sectors is too large for the mock backend");
+            std::process::exit(2);
+        });
         (
             Arc::new(Mutex::new(UblkTarget {
                 mapper: SectorMapper {
                     geometry,
-                    backend: HardwareBackend::Mock(MockBackend::new(geometry, args.sectors)),
+                    backend: HardwareBackend::Mock(MockBackend::new(geometry, sector_count)),
                 },
             })),
-            args.sectors as u64,
+            sectors,
         )
     };
     let ctrl = UblkCtrl::new(

@@ -40,6 +40,7 @@ pub struct SgIoBackend {
     file: File,
     geometry: Geometry,
     timeout_ms: u32,
+    blocks_per_physical: u32,
 }
 
 impl SgIoBackend {
@@ -49,6 +50,7 @@ impl SgIoBackend {
             file,
             geometry,
             timeout_ms: 60_000,
+            blocks_per_physical: 1,
         })
     }
 
@@ -61,6 +63,8 @@ impl SgIoBackend {
         self.command(&mut cdb, SG_DXFER_FROM_DEV, Some(&mut response))?;
         let last_lba = u64::from_be_bytes(response[0..8].try_into().unwrap());
         let block_size = u32::from_be_bytes(response[8..12].try_into().unwrap()) as usize;
+        let exponent = response[13] & 0x0f;
+        self.blocks_per_physical = 1u32 << exponent;
         Ok((
             last_lba.checked_add(1).ok_or(SectorError::OutOfRange)?,
             block_size,
@@ -69,11 +73,57 @@ impl SgIoBackend {
 
     pub fn format(&mut self, sectors: u64) -> Result<(), SectorError> {
         let payload = vec![0u8; self.geometry.payload_bytes];
-        for lba in 0..sectors {
-            let encoded = self.geometry.encode_sector(lba, &payload)?;
-            self.write_sector(lba, &encoded)?;
+        let group = u64::from(self.blocks_per_physical);
+        if !sectors.is_multiple_of(group) {
+            return Err(SectorError::Unaligned);
+        }
+        let mut lba = 0;
+        while lba < sectors {
+            let count = (sectors - lba).min(group);
+            let mut data =
+                Vec::with_capacity(usize::try_from(count).unwrap() * self.geometry.physical_bytes);
+            for offset in 0..count {
+                data.extend_from_slice(&self.geometry.encode_sector(lba + offset, &payload)?);
+            }
+            self.write_blocks(lba / group, 1, &data)?;
+            lba += count;
         }
         self.flush()
+    }
+
+    fn read_blocks(&mut self, lba: u64, count: u32, out: &mut [u8]) -> Result<(), SectorError> {
+        let mut cdb = [0u8; 16];
+        cdb[0] = 0x88;
+        cdb[2..10].copy_from_slice(
+            &lba.checked_mul(u64::from(self.blocks_per_physical))
+                .ok_or(SectorError::OutOfRange)?
+                .to_be_bytes(),
+        );
+        cdb[10..14].copy_from_slice(
+            &count
+                .checked_mul(self.blocks_per_physical)
+                .ok_or(SectorError::OutOfRange)?
+                .to_be_bytes(),
+        );
+        self.command(&mut cdb, SG_DXFER_FROM_DEV, Some(out))
+    }
+
+    fn write_blocks(&mut self, lba: u64, count: u32, data: &[u8]) -> Result<(), SectorError> {
+        let mut cdb = [0u8; 16];
+        cdb[0] = 0x8a;
+        cdb[2..10].copy_from_slice(
+            &lba.checked_mul(u64::from(self.blocks_per_physical))
+                .ok_or(SectorError::OutOfRange)?
+                .to_be_bytes(),
+        );
+        cdb[10..14].copy_from_slice(
+            &count
+                .checked_mul(self.blocks_per_physical)
+                .ok_or(SectorError::OutOfRange)?
+                .to_be_bytes(),
+        );
+        let mut data = data.to_vec();
+        self.command(&mut cdb, SG_DXFER_TO_DEV, Some(&mut data))
     }
 
     fn command(
@@ -132,32 +182,46 @@ impl SgIoBackend {
 
 impl Backend for SgIoBackend {
     fn read_sector(&mut self, lba: u64, out: &mut [u8]) -> Result<(), SectorError> {
-        if out.len() != self.geometry.physical_bytes {
+        if out.len() != self.geometry.payload_bytes {
             return Err(SectorError::InvalidSectorLength {
                 actual: out.len(),
-                expected: self.geometry.physical_bytes,
+                expected: self.geometry.payload_bytes,
             });
         }
-        let mut cdb = [0u8; 16];
-        cdb[0] = 0x88;
-        cdb[2..10].copy_from_slice(&lba.to_be_bytes());
-        cdb[10..14].copy_from_slice(&1u32.to_be_bytes());
-        self.command(&mut cdb, SG_DXFER_FROM_DEV, Some(out))
+        let group = self.blocks_per_physical as usize;
+        let index = usize::try_from(lba % u64::from(self.blocks_per_physical)).unwrap();
+        let mut data = vec![0u8; self.geometry.physical_bytes * group];
+        self.read_blocks(lba / u64::from(self.blocks_per_physical), 1, &mut data)?;
+        let payload = self.geometry.decode_sector(
+            lba,
+            &data[index * self.geometry.physical_bytes..(index + 1) * self.geometry.physical_bytes],
+        )?;
+        out.copy_from_slice(&payload);
+        Ok(())
     }
 
     fn write_sector(&mut self, lba: u64, data: &[u8]) -> Result<(), SectorError> {
-        if data.len() != self.geometry.physical_bytes {
+        if data.len() != self.geometry.payload_bytes {
             return Err(SectorError::InvalidSectorLength {
                 actual: data.len(),
-                expected: self.geometry.physical_bytes,
+                expected: self.geometry.payload_bytes,
             });
         }
-        let mut cdb = [0u8; 16];
-        cdb[0] = 0x8a;
-        cdb[2..10].copy_from_slice(&lba.to_be_bytes());
-        cdb[10..14].copy_from_slice(&1u32.to_be_bytes());
-        let mut data = data.to_vec();
-        self.command(&mut cdb, SG_DXFER_TO_DEV, Some(&mut data))
+        let encoded = self.geometry.encode_sector(lba, data)?;
+        let group = self.blocks_per_physical as usize;
+        let index = usize::try_from(lba % u64::from(self.blocks_per_physical)).unwrap();
+        let mut group_data = vec![0u8; self.geometry.physical_bytes * group];
+        if self.blocks_per_physical > 1 {
+            self.read_blocks(
+                lba / u64::from(self.blocks_per_physical),
+                1,
+                &mut group_data,
+            )?;
+        }
+        group_data
+            [index * self.geometry.physical_bytes..(index + 1) * self.geometry.physical_bytes]
+            .copy_from_slice(&encoded);
+        self.write_blocks(lba / u64::from(self.blocks_per_physical), 1, &group_data)
     }
 
     fn flush(&mut self) -> Result<(), SectorError> {

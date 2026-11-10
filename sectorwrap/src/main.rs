@@ -27,9 +27,13 @@ enum CommandLine {
     Format {
         #[arg(long)]
         yes: bool,
+        #[arg(long, help = "Only format this many logical sectors")]
+        sectors: Option<u64>,
         devices: Vec<PathBuf>,
     },
     Start {
+        #[arg(long, help = "Expose at most this many logical sectors")]
+        sectors: Option<u64>,
         devices: Vec<PathBuf>,
     },
     Stop {
@@ -49,8 +53,12 @@ fn main() {
     let cli = Cli::parse();
     let result = match cli.command {
         CommandLine::Status => status(),
-        CommandLine::Format { yes, devices } => format_devices(yes, &devices),
-        CommandLine::Start { devices } => start_devices(&devices),
+        CommandLine::Format {
+            yes,
+            sectors,
+            devices,
+        } => format_devices(yes, sectors, &devices),
+        CommandLine::Start { sectors, devices } => start_devices(sectors, &devices),
         CommandLine::Stop { device } => stop_device(&device),
     };
     if let Err(error) = result {
@@ -59,9 +67,16 @@ fn main() {
     }
 }
 
-fn format_devices(yes: bool, devices: &[PathBuf]) -> Result<(), Box<dyn std::error::Error>> {
+fn format_devices(
+    yes: bool,
+    sector_limit: Option<u64>,
+    devices: &[PathBuf],
+) -> Result<(), Box<dyn std::error::Error>> {
     if devices.is_empty() {
         return Err("format requires at least one /dev/sgX device".into());
+    }
+    if sector_limit == Some(0) {
+        return Err("--sectors must be greater than zero".into());
     }
     let mut plans = Vec::new();
     for path in devices {
@@ -70,11 +85,15 @@ fn format_devices(yes: bool, devices: &[PathBuf]) -> Result<(), Box<dyn std::err
             Geometry::for_sector_size(528)?,
         )
         .map_err(|e| format!("{path:?}: {e}"))?;
-        let (sectors, block_size) = probe.capacity().map_err(|e| format!("{path:?}: {e}"))?;
+        let (capacity, block_size) = probe.capacity().map_err(|e| format!("{path:?}: {e}"))?;
         if block_size == 512 {
             return Err(format!("{path:?}: native 512-byte media must not be formatted").into());
         }
         let geometry = Geometry::for_sector_size(block_size)?;
+        let sectors = sector_limit.unwrap_or(capacity);
+        if sectors > capacity {
+            return Err(format!("{path:?}: --sectors exceeds the device capacity").into());
+        }
         plans.push((path, sectors, block_size, geometry));
     }
     println!("! WARNING POTENTIAL DATA LOSS !");
@@ -82,7 +101,10 @@ fn format_devices(yes: bool, devices: &[PathBuf]) -> Result<(), Box<dyn std::err
     for (path, _, _, _) in &plans {
         println!("   - {}", path.display());
     }
-    println!("The complete payload of every device will be overwritten.");
+    println!(
+        "The first {} logical sectors of every device will be overwritten.",
+        sector_limit.map_or_else(|| "all".to_owned(), |value| value.to_string())
+    );
     if !yes {
         print!("Confirm? (y/N) ");
         io::stdout().flush()?;
@@ -104,15 +126,22 @@ fn format_devices(yes: bool, devices: &[PathBuf]) -> Result<(), Box<dyn std::err
             geometry.protection
         );
         let mut backend = SgIoBackend::open(path.to_str().ok_or("invalid device path")?, geometry)?;
+        backend.capacity()?;
         backend.format(sectors)?;
         println!("Format completed: {}", path.display());
     }
     Ok(())
 }
 
-fn start_devices(devices: &[PathBuf]) -> Result<(), Box<dyn std::error::Error>> {
+fn start_devices(
+    sector_limit: Option<u64>,
+    devices: &[PathBuf],
+) -> Result<(), Box<dyn std::error::Error>> {
     if devices.is_empty() {
         return Err("start requires at least one /dev/sgX device".into());
+    }
+    if sector_limit == Some(0) {
+        return Err("--sectors must be greater than zero".into());
     }
     fs::create_dir_all(STATE_DIR)?;
     let mut mappings = read_mappings()?;
@@ -123,15 +152,20 @@ fn start_devices(devices: &[PathBuf]) -> Result<(), Box<dyn std::error::Error>> 
             return Err(format!("{sg} is already mapped").into());
         }
         let mut probe = SgIoBackend::open(&sg, Geometry::for_sector_size(528)?)?;
-        let (_, block_size) = probe.capacity()?;
+        let (capacity, block_size) = probe.capacity()?;
         let geometry = if block_size == 512 {
             None
         } else {
             Some(Geometry::for_sector_size(block_size)?)
         };
+        let sectors = sector_limit.unwrap_or(capacity);
+        if sectors > capacity {
+            return Err(format!("{sg}: --sectors exceeds the device capacity").into());
+        }
         let sector_size = geometry.map(|g| g.physical_bytes).unwrap_or(512);
         let id = next_id(&mappings);
-        let child = Command::new(&worker)
+        let mut command = Command::new(&worker);
+        command
             .arg("--device")
             .arg(&sg)
             .arg("--sector-size")
@@ -141,7 +175,11 @@ fn start_devices(devices: &[PathBuf]) -> Result<(), Box<dyn std::error::Error>> 
             .arg("--queues")
             .arg("1")
             .arg("--depth")
-            .arg("64")
+            .arg("64");
+        if let Some(sector_limit) = sector_limit {
+            command.arg("--sectors").arg(sector_limit.to_string());
+        }
+        let child = command
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::inherit())

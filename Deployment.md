@@ -178,9 +178,10 @@ volume, multipath device, or other consumer.
 
 ## Format a protected device
 
-`sectorwrap format` initializes the complete physical media. It writes a zero
-payload and newly generated protection data for every sector, so the operation
-is destructive and can take a long time on large disks.
+`sectorwrap format` initializes the complete physical media unless `--sectors`
+is supplied. It writes a zero payload and newly generated protection data for
+every selected sector, so the operation is destructive and can take a long
+time on large disks.
 
 Interactive formatting:
 
@@ -204,6 +205,22 @@ the device path:
 sudo sectorwrap format --yes /dev/sg5
 ```
 
+For a bounded bring-up test, limit both formatting and the exported mapping.
+The following selects at most the first 16 GiB of 528-byte logical sectors
+(including their protection tails):
+
+```sh
+SECTORS=$((16*1024*1024*1024/528/8*8))
+sudo sectorwrap format --yes --sectors "$SECTORS" /dev/sg5
+sudo sectorwrap start --sectors "$SECTORS" /dev/sg5
+```
+
+`--sectors` counts the device's 528-byte logical sectors; rounding down to a
+multiple of eight keeps the 4224-byte physical transfers aligned.
+
+Do not omit the limit on `start`: otherwise the ublk device exposes the
+complete capacity even if only a prefix was formatted.
+
 The format layout is selected from the reported physical sector size:
 
 | Physical sector | User payload | Hidden protection |
@@ -221,6 +238,12 @@ Start one or more devices:
 
 ```sh
 sudo sectorwrap start /dev/sg5
+```
+
+Use `--sectors` to expose only a bounded prefix during hardware testing:
+
+```sh
+sudo sectorwrap start --sectors "$SECTORS" /dev/sg5
 ```
 
 Multiple devices can be started in one command:
@@ -372,4 +395,3 @@ Before `mkfs`:
 - Confirm that the target is `/dev/ublkbN`, not `/dev/sgX` or `/dev/sdX`.
 - Confirm the expected logical capacity with `lsblk`.
 - Confirm that the underlying device is not accessed separately.
-
