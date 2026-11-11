@@ -34,6 +34,13 @@ enum CommandLine {
     Start {
         #[arg(long, help = "Expose at most this many logical sectors")]
         sectors: Option<u64>,
+        #[arg(long, default_value_t = 4, help = "Number of independent ublk queues")]
+        queues: u16,
+        #[arg(
+            long,
+            help = "Skip LBA/ECC validation on reads; writes remain protected"
+        )]
+        raw_payload: bool,
         devices: Vec<PathBuf>,
     },
     Stop {
@@ -58,7 +65,12 @@ fn main() {
             sectors,
             devices,
         } => format_devices(yes, sectors, &devices),
-        CommandLine::Start { sectors, devices } => start_devices(sectors, &devices),
+        CommandLine::Start {
+            sectors,
+            queues,
+            raw_payload,
+            devices,
+        } => start_devices(sectors, queues, raw_payload, &devices),
         CommandLine::Stop { device } => stop_device(&device),
     };
     if let Err(error) = result {
@@ -135,6 +147,8 @@ fn format_devices(
 
 fn start_devices(
     sector_limit: Option<u64>,
+    queues: u16,
+    raw_payload: bool,
     devices: &[PathBuf],
 ) -> Result<(), Box<dyn std::error::Error>> {
     if devices.is_empty() {
@@ -142,6 +156,9 @@ fn start_devices(
     }
     if sector_limit == Some(0) {
         return Err("--sectors must be greater than zero".into());
+    }
+    if queues == 0 {
+        return Err("--queues must be greater than zero".into());
     }
     fs::create_dir_all(STATE_DIR)?;
     let mut mappings = read_mappings()?;
@@ -173,9 +190,12 @@ fn start_devices(
             .arg("--id")
             .arg(id.to_string())
             .arg("--queues")
-            .arg("1")
+            .arg(queues.to_string())
             .arg("--depth")
             .arg("64");
+        if raw_payload {
+            command.arg("--raw-payload");
+        }
         if let Some(sector_limit) = sector_limit {
             command.arg("--sectors").arg(sector_limit.to_string());
         }

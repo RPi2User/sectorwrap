@@ -101,6 +101,16 @@ sudo sectorwrap start /dev/sg0 /dev/sg2 /dev/sg6
 sudo sectorwrap stop /dev/ublkb0
 ```
 
+`start` uses four independent ublk queues by default. Override this with
+`--queues N` when comparing queue counts or when a device/HBA has a lower
+concurrency limit. For a read-only performance comparison, use
+`--raw-payload`; it skips LBA/ECC validation on reads while retaining the
+protected write path:
+
+```sh
+sudo sectorwrap start --queues 4 --raw-payload /dev/sg1
+```
+
 `status` probes every `/dev/sg*` device with SCSI `READ CAPACITY(16)` and
 reports physical sector size, capacity, and active mappings. Native 512-byte
 devices are supported as passthrough mappings; they do not receive synthetic
@@ -172,6 +182,45 @@ sudo umount /mnt/sectorwrap-test
 Stop the foreground process with `Ctrl-C` after unmounting. Do not format the
 underlying SCSI device directly: that would bypass sectorwrap's LBA and BCH
 protection tail.
+
+## Measure a block device
+
+The repository includes a CSV benchmark script for any Linux block device.
+It runs staged sequential and random read tests by default. The stages
+increase block size, queue depth, and parallelism; the device is not modified
+unless `--write-tests` is explicitly supplied:
+
+```sh
+sudo ./scripts/measure-blockdevice.sh \
+  --output /tmp/sectorwrap.csv \
+  --size 1G \
+  --runtime 30 \
+  /dev/ublkb0
+```
+
+The CSV contains one row per test with throughput, IOPS, runtime, and
+latency (mean, p50, p95, and p99), plus the stage parameters. Write tests are
+destructive and should only be run against an unmounted test device:
+
+```sh
+sudo ./scripts/measure-blockdevice.sh \
+  --write-tests --output /tmp/sectorwrap-with-writes.csv /dev/ublkb0
+```
+
+The script requires `fio` and `python3`. It appends to an existing CSV, so
+use a new output file for a separate measurement series. To run selected
+stages only, pass a comma-separated list such as
+`--stages baseline,large-block,queue4`.
+Use `--runs 3` for repeated samples per stage; the CSV records the run
+number and computes aggregate throughput from the actual fio runtime.
+
+The ublk worker now batches all logical sectors from one request into a
+single SG_IO transfer covering the required physical groups, and each ublk
+queue owns an independent SG_IO file descriptor. This removes the previous
+global backend lock and avoids repeating a physical 4224-byte read for every
+528-byte logical sector. The worker request limit is 1 MiB. Raw-payload mode
+is intended for read benchmarking and intentionally does not validate LBA or
+ECC metadata on reads.
 
 ## License
 

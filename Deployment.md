@@ -212,7 +212,7 @@ The following selects at most the first 16 GiB of 528-byte logical sectors
 ```sh
 SECTORS=$((16*1024*1024*1024/528/8*8))
 sudo sectorwrap format --yes --sectors "$SECTORS" /dev/sg5
-sudo sectorwrap start --sectors "$SECTORS" /dev/sg5
+sudo sectorwrap start --sectors "$SECTORS" --queues 4 /dev/sg5
 ```
 
 `--sectors` counts the device's 528-byte logical sectors; rounding down to a
@@ -237,7 +237,13 @@ by `format`.
 Start one or more devices:
 
 ```sh
-sudo sectorwrap start /dev/sg5
+sudo sectorwrap start --queues 4 /dev/sg5
+```
+
+For a read-only throughput comparison that skips protection validation:
+
+```sh
+sudo sectorwrap start --queues 4 --raw-payload /dev/sg5
 ```
 
 Use `--sectors` to expose only a bounded prefix during hardware testing:

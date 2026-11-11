@@ -238,6 +238,36 @@ pub trait Backend {
     fn read_sector(&mut self, lba: u64, out: &mut [u8]) -> Result<(), SectorError>;
     fn write_sector(&mut self, lba: u64, data: &[u8]) -> Result<(), SectorError>;
     fn flush(&mut self) -> Result<(), SectorError>;
+
+    fn read_sectors(
+        &mut self,
+        lba: u64,
+        out: &mut [u8],
+        sector_bytes: usize,
+    ) -> Result<(), SectorError> {
+        if sector_bytes == 0 || !out.len().is_multiple_of(sector_bytes) {
+            return Err(SectorError::Unaligned);
+        }
+        for (index, chunk) in out.chunks_exact_mut(sector_bytes).enumerate() {
+            self.read_sector(lba + index as u64, chunk)?;
+        }
+        Ok(())
+    }
+
+    fn write_sectors(
+        &mut self,
+        lba: u64,
+        data: &[u8],
+        sector_bytes: usize,
+    ) -> Result<(), SectorError> {
+        if sector_bytes == 0 || !data.len().is_multiple_of(sector_bytes) {
+            return Err(SectorError::Unaligned);
+        }
+        for (index, chunk) in data.chunks_exact(sector_bytes).enumerate() {
+            self.write_sector(lba + index as u64, chunk)?;
+        }
+        Ok(())
+    }
 }
 
 pub struct SectorMapper<B> {
@@ -248,27 +278,20 @@ pub struct SectorMapper<B> {
 impl<B: Backend> SectorMapper<B> {
     pub fn read(&mut self, offset: u64, out: &mut [u8]) -> Result<(), SectorError> {
         self.check_request(offset, out.len())?;
-        for (index, chunk) in out
-            .chunks_exact_mut(self.geometry.payload_bytes)
-            .enumerate()
-        {
-            self.backend.read_sector(
-                offset / self.geometry.payload_bytes as u64 + index as u64,
-                chunk,
-            )?;
-        }
-        Ok(())
+        self.backend.read_sectors(
+            offset / self.geometry.payload_bytes as u64,
+            out,
+            self.geometry.payload_bytes,
+        )
     }
 
     pub fn write(&mut self, offset: u64, data: &[u8]) -> Result<(), SectorError> {
         self.check_request(offset, data.len())?;
-        for (index, chunk) in data.chunks_exact(self.geometry.payload_bytes).enumerate() {
-            self.backend.write_sector(
-                offset / self.geometry.payload_bytes as u64 + index as u64,
-                chunk,
-            )?;
-        }
-        Ok(())
+        self.backend.write_sectors(
+            offset / self.geometry.payload_bytes as u64,
+            data,
+            self.geometry.payload_bytes,
+        )
     }
 
     pub fn flush(&mut self) -> Result<(), SectorError> {

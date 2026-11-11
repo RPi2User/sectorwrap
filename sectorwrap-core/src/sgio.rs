@@ -1,6 +1,7 @@
 #![cfg(target_os = "linux")]
 
 use crate::{Backend, Geometry, SectorError};
+use std::alloc::{alloc_zeroed, dealloc, Layout};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::os::fd::AsRawFd;
@@ -9,6 +10,38 @@ const SG_IO: u64 = 0x2285;
 const SG_DXFER_FROM_DEV: i32 = -3;
 const SG_DXFER_TO_DEV: i32 = -2;
 const SG_DXFER_NONE: i32 = -1;
+const MAX_SCSI_BLOCKS_PER_COMMAND: u64 = 128;
+const SG_BUFFER_ALIGNMENT: usize = 512;
+
+struct AlignedBuffer {
+    ptr: *mut u8,
+    len: usize,
+}
+
+impl AlignedBuffer {
+    fn new(len: usize) -> Result<Self, SectorError> {
+        let layout =
+            Layout::from_size_align(len, SG_BUFFER_ALIGNMENT).map_err(|_| SectorError::OutOfRange)?;
+        let ptr = unsafe { alloc_zeroed(layout) };
+        if ptr.is_null() {
+            return Err(SectorError::Io(io::Error::other(
+                "aligned SG buffer allocation failed",
+            )));
+        }
+        Ok(Self { ptr, len })
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
+    }
+}
+
+impl Drop for AlignedBuffer {
+    fn drop(&mut self) {
+        let layout = Layout::from_size_align(self.len, SG_BUFFER_ALIGNMENT).unwrap();
+        unsafe { dealloc(self.ptr, layout) };
+    }
+}
 
 #[repr(C)]
 struct SgIoHdr {
@@ -41,6 +74,7 @@ pub struct SgIoBackend {
     geometry: Geometry,
     timeout_ms: u32,
     blocks_per_physical: u32,
+    raw_payload: bool,
 }
 
 impl SgIoBackend {
@@ -51,6 +85,7 @@ impl SgIoBackend {
             geometry,
             timeout_ms: 60_000,
             blocks_per_physical: 1,
+            raw_payload: false,
         })
     }
 
@@ -69,6 +104,24 @@ impl SgIoBackend {
             last_lba.checked_add(1).ok_or(SectorError::OutOfRange)?,
             block_size,
         ))
+    }
+
+    pub fn try_clone(&self) -> Result<Self, SectorError> {
+        Ok(Self {
+            file: self.file.try_clone()?,
+            geometry: self.geometry,
+            timeout_ms: self.timeout_ms,
+            blocks_per_physical: self.blocks_per_physical,
+            raw_payload: self.raw_payload,
+        })
+    }
+
+    pub fn geometry(&self) -> Geometry {
+        self.geometry
+    }
+
+    pub fn set_raw_payload(&mut self, enabled: bool) {
+        self.raw_payload = enabled;
     }
 
     pub fn format(&mut self, sectors: u64) -> Result<(), SectorError> {
@@ -129,8 +182,9 @@ impl SgIoBackend {
                 .ok_or(SectorError::OutOfRange)?
                 .to_be_bytes(),
         );
-        let mut data = data.to_vec();
-        self.command(&mut cdb, SG_DXFER_TO_DEV, Some(&mut data))
+        let mut aligned = AlignedBuffer::new(data.len())?;
+        aligned.as_mut_slice().copy_from_slice(data);
+        self.command(&mut cdb, SG_DXFER_TO_DEV, Some(aligned.as_mut_slice()))
     }
 
     fn command(
@@ -229,6 +283,114 @@ impl Backend for SgIoBackend {
             [index * self.geometry.physical_bytes..(index + 1) * self.geometry.physical_bytes]
             .copy_from_slice(&encoded);
         self.write_blocks(lba / u64::from(self.blocks_per_physical), 1, &group_data)
+    }
+
+    fn read_sectors(
+        &mut self,
+        lba: u64,
+        out: &mut [u8],
+        sector_bytes: usize,
+    ) -> Result<(), SectorError> {
+        if sector_bytes != self.geometry.payload_bytes
+            || out.is_empty()
+            || !out.len().is_multiple_of(sector_bytes)
+        {
+            return Err(SectorError::Unaligned);
+        }
+        let group = u64::from(self.blocks_per_physical);
+        let total = out.len() / sector_bytes;
+        let mut completed = 0usize;
+        while completed < total {
+            let current_lba = lba + completed as u64;
+            let max_groups = (MAX_SCSI_BLOCKS_PER_COMMAND / group).max(1);
+            let available = max_groups * group - current_lba % group;
+            let count = available.min((total - completed) as u64) as usize;
+            let first_group = current_lba / group;
+            let group_count = (current_lba % group + count as u64).div_ceil(group);
+            let group_count_u32 =
+                u32::try_from(group_count).map_err(|_| SectorError::OutOfRange)?;
+            let bytes = group_count
+                .checked_mul(u64::from(self.blocks_per_physical))
+                .and_then(|value| value.checked_mul(self.geometry.physical_bytes as u64))
+                .and_then(|value| usize::try_from(value).ok())
+                .ok_or(SectorError::OutOfRange)?;
+            let mut raw = AlignedBuffer::new(bytes)?;
+            self.read_blocks(first_group, group_count_u32, raw.as_mut_slice())?;
+            for index in 0..count {
+                let sector_lba = current_lba + index as u64;
+                let group_index = usize::try_from(sector_lba / group - first_group)
+                    .map_err(|_| SectorError::OutOfRange)?;
+                let in_group =
+                    usize::try_from(sector_lba % group).map_err(|_| SectorError::OutOfRange)?;
+                let start = (group_index * self.blocks_per_physical as usize + in_group)
+                    * self.geometry.physical_bytes;
+                let physical = &raw.as_mut_slice()[start..start + self.geometry.physical_bytes];
+                let output = &mut out
+                    [(completed + index) * sector_bytes..(completed + index + 1) * sector_bytes];
+                if self.raw_payload {
+                    output.copy_from_slice(&physical[..self.geometry.payload_bytes]);
+                } else {
+                    output.copy_from_slice(&self.geometry.decode_sector(sector_lba, physical)?);
+                }
+            }
+            completed += count;
+        }
+        Ok(())
+    }
+
+    fn write_sectors(
+        &mut self,
+        lba: u64,
+        data: &[u8],
+        sector_bytes: usize,
+    ) -> Result<(), SectorError> {
+        if sector_bytes != self.geometry.payload_bytes
+            || data.is_empty()
+            || !data.len().is_multiple_of(sector_bytes)
+        {
+            return Err(SectorError::Unaligned);
+        }
+        let group = u64::from(self.blocks_per_physical);
+        let total = data.len() / sector_bytes;
+        let mut completed = 0usize;
+        while completed < total {
+            let current_lba = lba + completed as u64;
+            let max_groups = (MAX_SCSI_BLOCKS_PER_COMMAND / group).max(1);
+            let available = max_groups * group - current_lba % group;
+            let count = available.min((total - completed) as u64) as usize;
+            let first_group = current_lba / group;
+            let group_count = (current_lba % group + count as u64).div_ceil(group);
+            let group_count_u32 =
+                u32::try_from(group_count).map_err(|_| SectorError::OutOfRange)?;
+            let bytes = group_count
+                .checked_mul(u64::from(self.blocks_per_physical))
+                .and_then(|value| value.checked_mul(self.geometry.physical_bytes as u64))
+                .and_then(|value| usize::try_from(value).ok())
+                .ok_or(SectorError::OutOfRange)?;
+            let mut raw = AlignedBuffer::new(bytes)?;
+            if group > 1 {
+                self.read_blocks(first_group, group_count_u32, raw.as_mut_slice())?;
+            }
+            for index in 0..count {
+                let sector_lba = current_lba + index as u64;
+                let group_index = usize::try_from(sector_lba / group - first_group)
+                    .map_err(|_| SectorError::OutOfRange)?;
+                let in_group =
+                    usize::try_from(sector_lba % group).map_err(|_| SectorError::OutOfRange)?;
+                let start = (group_index * self.blocks_per_physical as usize + in_group)
+                    * self.geometry.physical_bytes;
+                let encoded = self.geometry.encode_sector(
+                    sector_lba,
+                    &data[(completed + index) * sector_bytes
+                        ..(completed + index + 1) * sector_bytes],
+                )?;
+                raw.as_mut_slice()[start..start + self.geometry.physical_bytes]
+                    .copy_from_slice(&encoded);
+            }
+            self.write_blocks(first_group, group_count_u32, raw.as_mut_slice())?;
+            completed += count;
+        }
+        Ok(())
     }
 
     fn flush(&mut self) -> Result<(), SectorError> {

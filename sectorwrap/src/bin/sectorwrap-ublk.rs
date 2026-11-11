@@ -4,7 +4,7 @@ use libublk::{ctrl::UblkCtrl, BufDesc, UblkError, UblkFlags, UblkIORes};
 use sectorwrap_core::sgio::SgIoBackend;
 use sectorwrap_core::ublk::{RequestOp, UblkRequest, UblkTarget};
 use sectorwrap_core::{Backend, Geometry, MockBackend, SectorMapper};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 #[derive(Parser, Debug)]
 struct Args {
@@ -16,15 +16,58 @@ struct Args {
     sectors: Option<u64>,
     #[arg(long, default_value_t = -1)]
     id: i32,
-    #[arg(long, default_value_t = 1)]
+    #[arg(long, default_value_t = 4)]
     queues: u16,
     #[arg(long, default_value_t = 64)]
     depth: u16,
+    #[arg(
+        long,
+        help = "Skip LBA/ECC validation on reads; writes remain protected"
+    )]
+    raw_payload: bool,
 }
 
 enum HardwareBackend {
     Mock(MockBackend),
     Sg(SgIoBackend),
+}
+
+enum TargetFactory {
+    Mock {
+        geometry: Geometry,
+        sectors: usize,
+    },
+    Sg {
+        backend: Arc<SgIoBackend>,
+        raw_payload: bool,
+    },
+}
+
+impl TargetFactory {
+    fn build(&self) -> Result<UblkTarget<HardwareBackend>, sectorwrap_core::SectorError> {
+        let backend = match self {
+            Self::Mock { geometry, sectors } => {
+                HardwareBackend::Mock(MockBackend::new(*geometry, *sectors))
+            }
+            Self::Sg {
+                backend,
+                raw_payload,
+            } => {
+                let mut backend = backend.try_clone()?;
+                backend.set_raw_payload(*raw_payload);
+                HardwareBackend::Sg(backend)
+            }
+        };
+        Ok(UblkTarget {
+            mapper: SectorMapper {
+                geometry: match self {
+                    Self::Mock { geometry, .. } => *geometry,
+                    Self::Sg { backend, .. } => backend.geometry(),
+                },
+                backend,
+            },
+        })
+    }
 }
 
 impl Backend for HardwareBackend {
@@ -43,6 +86,30 @@ impl Backend for HardwareBackend {
         match self {
             Self::Mock(backend) => backend.write_sector(lba, data),
             Self::Sg(backend) => backend.write_sector(lba, data),
+        }
+    }
+
+    fn read_sectors(
+        &mut self,
+        lba: u64,
+        out: &mut [u8],
+        sector_bytes: usize,
+    ) -> Result<(), sectorwrap_core::SectorError> {
+        match self {
+            Self::Mock(backend) => backend.read_sectors(lba, out, sector_bytes),
+            Self::Sg(backend) => backend.read_sectors(lba, out, sector_bytes),
+        }
+    }
+
+    fn write_sectors(
+        &mut self,
+        lba: u64,
+        data: &[u8],
+        sector_bytes: usize,
+    ) -> Result<(), sectorwrap_core::SectorError> {
+        match self {
+            Self::Mock(backend) => backend.write_sectors(lba, data, sector_bytes),
+            Self::Sg(backend) => backend.write_sectors(lba, data, sector_bytes),
         }
     }
 
@@ -68,7 +135,14 @@ fn errno(error: &sectorwrap_core::SectorError) -> i32 {
     }
 }
 
-fn queue_handler(qid: u16, dev: &UblkDev, target: Arc<Mutex<UblkTarget<HardwareBackend>>>) {
+fn queue_handler(qid: u16, dev: &UblkDev, factory: Arc<TargetFactory>) {
+    let mut target = match factory.build() {
+        Ok(target) => target,
+        Err(error) => {
+            eprintln!("cannot create backend for queue {qid}: {error}");
+            return;
+        }
+    };
     let buffers = Arc::new(dev.alloc_queue_io_bufs());
     let fetch_buffers = buffers.clone();
     let handler = move |q: &UblkQueue, tag: u16, _io: &libublk::io::UblkIOCtx| {
@@ -94,19 +168,14 @@ fn queue_handler(qid: u16, dev: &UblkDev, target: Arc<Mutex<UblkTarget<HardwareB
         // Its safe immutable view is converted only for READ completion.
         let slice =
             unsafe { std::slice::from_raw_parts_mut(buffer.as_slice().as_ptr() as *mut u8, bytes) };
-        let result: Result<i32, UblkError> = target
-            .lock()
-            .map_err(|_| UblkError::OtherError(-libc::EIO))
-            .and_then(|mut target| {
-                target
-                    .handle(UblkRequest {
-                        op,
-                        offset,
-                        data: slice,
-                    })
-                    .map(|_| bytes as i32)
-                    .map_err(|e| UblkError::OtherError(-errno(&e)))
-            });
+        let result = target
+            .handle(UblkRequest {
+                op,
+                offset,
+                data: slice,
+            })
+            .map(|_| bytes as i32)
+            .map_err(|e| UblkError::OtherError(-errno(&e)));
         q.complete_io_cmd_unified(
             tag,
             BufDesc::Slice(fetch_buffers[tag as usize].as_slice()),
@@ -128,7 +197,7 @@ fn main() {
         eprintln!("invalid sector geometry: {e}");
         std::process::exit(2);
     });
-    let (target, sectors) = if let Some(path) = args.device.as_deref() {
+    let (factory, sectors) = if let Some(path) = args.device.as_deref() {
         let mut backend = SgIoBackend::open(path, geometry).unwrap_or_else(|e| {
             eprintln!("cannot open SG_IO device {path}: {e}");
             std::process::exit(2);
@@ -154,12 +223,10 @@ fn main() {
              do not use the underlying device simultaneously"
         );
         (
-            Arc::new(Mutex::new(UblkTarget {
-                mapper: SectorMapper {
-                    geometry,
-                    backend: HardwareBackend::Sg(backend),
-                },
-            })),
+            Arc::new(TargetFactory::Sg {
+                backend: Arc::new(backend),
+                raw_payload: args.raw_payload,
+            }),
             sectors,
         )
     } else {
@@ -169,12 +236,10 @@ fn main() {
             std::process::exit(2);
         });
         (
-            Arc::new(Mutex::new(UblkTarget {
-                mapper: SectorMapper {
-                    geometry,
-                    backend: HardwareBackend::Mock(MockBackend::new(geometry, sector_count)),
-                },
-            })),
+            Arc::new(TargetFactory::Mock {
+                geometry,
+                sectors: sector_count,
+            }),
             sectors,
         )
     };
@@ -183,20 +248,20 @@ fn main() {
         args.id,
         args.queues as u32,
         args.depth as u32,
-        geometry.payload_bytes as u32 * 128,
+        1024 * 1024,
         0,
         0,
         UblkFlags::UBLK_DEV_F_ADD_DEV,
     )
     .expect("create ublk control");
     let size = geometry.payload_bytes as u64 * sectors;
-    let target_for_queues = target.clone();
+    let factory_for_queues = factory.clone();
     ctrl.run_target(
         move |dev| {
             dev.set_default_params(size);
             Ok(())
         },
-        move |qid, dev| queue_handler(qid, dev, target_for_queues.clone()),
+        move |qid, dev| queue_handler(qid, dev, factory_for_queues.clone()),
         |_ctrl| {},
     )
     .expect("run ublk target");
